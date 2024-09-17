@@ -394,7 +394,7 @@ def fit(
     max_epochs=100,
     lr_plateau_patience=3,
     early_stopping_patience=5,
-    min_delta=0,
+    min_delta=0.001,
     kl_weight=1.0,
     isotropy_weight=1.0,
     l1_weight=0.001,

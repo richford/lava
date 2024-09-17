@@ -51,7 +51,14 @@ def main(
     device = torch.device(device_str)
 
     if mode == "optimize":
-        nested_cross_validation(train_loader, random_seed=random_seed, device=device)
+        nested_cross_validation(
+            train_loader,
+            random_seed=random_seed,
+            n_splits=5,
+            n_repeats=20,
+            n_trials=100,
+            device=device,
+        )
     elif mode == "train":
         _, best_hyperparams, _ = load_checkpoint(fold=0, checkpoint_dir=CHECKPOINT_DIR)
 
