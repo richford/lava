@@ -1,10 +1,10 @@
 import string
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import pandas as pd
 import typer
-from imblearn.under_sampling import RandomUnderSampler
 from loguru import logger
 from sklearn.model_selection import train_test_split
 
@@ -13,7 +13,17 @@ from lava.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
 app = typer.Typer()
 
 
-def undersample(df: pd.DataFrame, random_state: any) -> pd.DataFrame:
+def get_total_score_bins(X: pd.DataFrame, bins: List[int]) -> np.ndarray:
+    # Step 1: Compute total score for each response chain (summing across the 90 elements)
+    total_scores = X.sum(axis="columns", skipna=True)
+
+    # Step 2: Use the input qbins to bin by quantile. Remove the min and max bin thresholds.
+    bins = np.digitize(total_scores, bins=bins) - 1
+
+    return bins
+
+
+def undersample(df: pd.DataFrame, random_state: any, q: int) -> pd.DataFrame:
     # Step 1: Compute total score for each response chain (summing across the 90 elements)
     total_scores = df.sum(axis="columns", skipna=True)
     max_score = len(df.columns) - 1  # Exclude the target column
@@ -26,13 +36,21 @@ def undersample(df: pd.DataFrame, random_state: any) -> pd.DataFrame:
     df_non_perfect = df[~perfect_scorers_mask]
 
     logger.info(f"Resampling runs...")
-    logger.info(f"Found {df_perfect.shape[0]} perfect scores")
 
     # Apply undersampling to the perfect scorers
-    # Keep 50% of the perfect scorers
-    undersample_ratio = 0.5  # Adjust this ratio as necessary
-    rus = RandomUnderSampler(sampling_strategy=undersample_ratio, random_state=random_state)
-    df_perfect_resampled = rus.fit_resample(df_perfect)
+    # Keep this fraction of the perfect scorers
+    undersample_ratio = 0.4
+    df_perfect_resampled = df_perfect.sample(
+        frac=undersample_ratio,
+        replace=False,
+        random_state=random_state,
+        axis="index",
+        ignore_index=True,
+    )
+
+    logger.info(
+        f"Found {df_perfect.shape[0]} / {df.shape[0]} perfect scores. Removed {df_perfect.shape[0] - df_perfect_resampled.shape[0]}"
+    )
 
     # Combine the undersampled perfect scorers with the non-perfect scorers
     df_resampled = pd.concat(
@@ -44,10 +62,17 @@ def undersample(df: pd.DataFrame, random_state: any) -> pd.DataFrame:
         frac=1, replace=False, random_state=random_state, axis="index", ignore_index=True
     )
 
-    print(f"Original dataset size: {df.shape[0]}")
-    print(f"Resampled dataset size: {df_resampled.shape[0]}")
+    logger.info(f"Original dataset size: {df.shape[0]}")
+    logger.info(f"Resampled dataset size: {df_resampled.shape[0]}")
 
-    return df_resampled
+    total_scores = df_resampled.sum(axis="columns", skipna=True)
+    _, qbins = pd.qcut(total_scores, q=q, retbins=True)
+
+    qbins = np.round(qbins).astype(int)
+
+    logger.info(f"Quintile bins for resampled data: {qbins}")
+
+    return df_resampled, qbins
 
 
 @app.command()
@@ -104,7 +129,7 @@ def main(
     rng = np.random.RandomState(seed=random_seed)
 
     # Undersample the perfect scorers
-    letter_trials = undersample(letter_trials, random_state=rng)
+    letter_trials, qbins = undersample(letter_trials, random_state=rng, q=5)
 
     # Split into training (60%), test (20%), and report (20%) sets
     train_data, temp_data = train_test_split(letter_trials, test_size=0.4, random_state=rng)
@@ -114,6 +139,9 @@ def main(
     train_data.to_csv(f"{output_dir}/train.csv", index=False)
     test_data.to_csv(f"{output_dir}/test.csv", index=False)
     report_data.to_csv(f"{output_dir}/report.csv", index=False)
+
+    # Save the quantile bins
+    np.savetxt(f"{output_dir}/qbins.csv", qbins, delimiter=",", fmt="%d")
 
     # ---- REPLACE THIS WITH YOUR OWN CODE ----
     logger.success("Processing dataset complete.")

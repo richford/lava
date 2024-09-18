@@ -5,11 +5,12 @@ import numpy as np
 import torch
 import typer
 from loguru import logger
-from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 
 from lava.config import CHECKPOINT_DIR, MODELS_DIR, PROCESSED_DATA_DIR
+from lava.dataset import get_total_score_bins
 from lava.modeling.cross_validation import load_checkpoint, nested_cross_validation
 from lava.modeling.vae import VAE, fit, get_dataloader_from_csv, weights_init
 
@@ -20,8 +21,8 @@ app = typer.Typer()
 def main(
     mode: str = "train",
     train_path: Path = PROCESSED_DATA_DIR / "train.csv",
+    bins_path: Path = PROCESSED_DATA_DIR / "qbins.csv",
     model_path: Path = MODELS_DIR / "model.pth",
-    hyperparam_path: Path = MODELS_DIR / "best_hyperparams.npy",
     use_mps: bool = False,
     random_seed: int = 1729,
 ):
@@ -41,6 +42,8 @@ def main(
         csv_file=train_path, batch_size=batch_size, target_column=None
     )
 
+    qbins = np.loadtxt(bins_path, delimiter=",").tolist()
+
     if torch.cuda.is_available():
         device_str = "cuda"
     elif torch.backends.mps.is_available() and use_mps:
@@ -53,14 +56,19 @@ def main(
     if mode == "optimize":
         nested_cross_validation(
             train_loader,
+            qbins=qbins,
             random_seed=random_seed,
             n_splits=5,
-            n_repeats=20,
-            n_trials=100,
+            n_repeats=1,  # 20,
+            n_trials=2,  # 100,
             device=device,
         )
     elif mode == "train":
-        _, best_hyperparams, _ = load_checkpoint(fold=0, checkpoint_dir=CHECKPOINT_DIR)
+        _, best_hyperparams, _ = load_checkpoint(
+            fold=0,
+            input_dim=train_loader.dataset[0].shape[0],
+            checkpoint_dir=CHECKPOINT_DIR,
+        )
 
         if best_hyperparams is None:
             best_hyperparams = {
@@ -88,8 +96,9 @@ def main(
         optimizer = torch.optim.Adam(model.parameters(), lr=best_hyperparams["lr"])
 
         rng = np.random.RandomState(seed=random_seed)
-        shuffle_split = ShuffleSplit(test_size=0.2, random_state=rng)
-        train_idx, val_idx = next(shuffle_split.split(train_loader.dataset))
+        shuffle_split = StratifiedShuffleSplit(test_size=0.2, random_state=rng)
+        train_bins = get_total_score_bins(train_loader.dataset.data, qbins)
+        train_idx, val_idx = next(shuffle_split.split(train_loader.dataset, train_bins))
 
         train_sampler = SubsetRandomSampler(train_idx)
         val_sampler = SubsetRandomSampler(val_idx)

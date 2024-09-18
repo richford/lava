@@ -16,11 +16,12 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import RepeatedKFold, ShuffleSplit
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 
 from lava.config import CHECKPOINT_DIR
+from lava.dataset import get_total_score_bins
 from lava.modeling.vae import VAE, create_mask, fit, loss_function, weights_init
 
 
@@ -124,7 +125,7 @@ def load_checkpoint(fold, input_dim, checkpoint_dir=CHECKPOINT_DIR):
         model = VAE(
             input_dim=input_dim,
             hidden_dim=best_hyperparams["hidden_dim"],
-            latent_dim=2,
+            latent_dim=best_hyperparams["latent_dim"],
             min_val=-1.0,
             max_val=1.0,
         )
@@ -267,6 +268,7 @@ def predictive_performance(model, test_loader):
 
 def nested_cross_validation(
     data_loader,
+    qbins,
     n_splits=5,
     n_repeats=20,
     n_trials=50,
@@ -281,12 +283,18 @@ def nested_cross_validation(
     min_delta = 0.001
     batch_size = 128
 
+    # Create score bins for stratified KFold cross-validation
+    bins = get_total_score_bins(data_loader.dataset.data, qbins)
+    logger.debug(f"Score bins: {bins}")
+
     current_cv_params = {
+        "qbins": qbins,
         "n_splits": n_splits,
         "n_repeats": n_repeats,
         "random_seed": random_seed,
         "test_size": test_size,
         "batch_size": batch_size,
+        "latent_dim": 2,
         "fit_params": {
             "max_epochs": max_epochs,
             "lr_plateau_patience": lr_plateau_patience,
@@ -296,7 +304,7 @@ def nested_cross_validation(
     }
 
     rng = np.random.RandomState(seed=random_seed)
-    outer_cv = RepeatedKFold(n_repeats=n_repeats, n_splits=n_splits, random_state=rng)
+    outer_cv = RepeatedStratifiedKFold(n_repeats=n_repeats, n_splits=n_splits, random_state=rng)
     models = []
     test_scores = []
     best_hyperparams = []
@@ -316,7 +324,7 @@ def nested_cross_validation(
 
     # First split the data into training and validation sets
     # The validation set is used to tune hyperparameters
-    for fold, (train_test_idx, val_idx) in enumerate(outer_cv.split(data_loader.dataset)):
+    for fold, (train_test_idx, val_idx) in enumerate(outer_cv.split(data_loader.dataset, bins)):
         model, hyperparams, test_score = load_checkpoint(
             fold=fold, input_dim=input_dim, checkpoint_dir=checkpoint_dir
         )
@@ -335,7 +343,7 @@ def nested_cross_validation(
         )
         val_loader = DataLoader(data_loader.dataset, batch_size=batch_size, sampler=val_sampler)
 
-        shuffle_split = ShuffleSplit(test_size=test_size, random_state=rng)
+        shuffle_split = StratifiedShuffleSplit(test_size=test_size, random_state=rng)
 
         def objective(trial):
             hidden_dim = trial.suggest_int("hidden_dim", 16, 64)
@@ -360,11 +368,14 @@ def nested_cross_validation(
             monotonicity_weight = trial.suggest_float("monotonicity_weight", 0.0, 0.0)
             kl_weight = trial.suggest_float("kl_weight", 1.0, 1.0)
             unit_variance_weight = trial.suggest_float("unit_variance_weight", 0.0, 0.0)
+            latent_dim = trial.suggest_int(
+                "latent_dim", current_cv_params["latent_dim"], current_cv_params["latent_dim"]
+            )
 
             model = VAE(
                 input_dim=input_dim,
                 hidden_dim=hidden_dim,
-                latent_dim=2,
+                latent_dim=latent_dim,
                 min_val=-1.0,
                 max_val=1.0,
             ).to(device)
@@ -375,7 +386,10 @@ def nested_cross_validation(
 
             # Split the training set into training and test sets
             # The test set is used to for early stopping and the the learning rate scheduler
-            train_idx, test_idx = next(shuffle_split.split(train_test_loader.dataset))
+            train_test_bins = get_total_score_bins(train_test_loader.dataset.data, qbins)
+            train_idx, test_idx = next(
+                shuffle_split.split(train_test_loader.dataset, train_test_bins)
+            )
 
             train_sampler = SubsetRandomSampler(train_idx)
             test_sampler = SubsetRandomSampler(test_idx)
@@ -428,7 +442,7 @@ def nested_cross_validation(
         model = VAE(
             input_dim=input_dim,
             hidden_dim=study.best_params["hidden_dim"],
-            latent_dim=2,
+            latent_dim=study.best_params["latent_dim"],
             min_val=-1.0,
             max_val=1.0,
         ).to(device)
@@ -439,7 +453,8 @@ def nested_cross_validation(
 
         # Split the training set into training and test sets
         # The test set is used to for early stopping and the the learning rate scheduler
-        train_idx, test_idx = next(shuffle_split.split(train_test_loader.dataset))
+        train_test_bins = get_total_score_bins(train_test_loader.dataset.data, qbins)
+        train_idx, test_idx = next(shuffle_split.split(train_test_loader.dataset, train_test_bins))
 
         train_sampler = SubsetRandomSampler(train_idx)
         test_sampler = SubsetRandomSampler(test_idx)
